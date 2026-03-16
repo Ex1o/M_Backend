@@ -49,7 +49,25 @@ def allowed_file(filename, allowed_set):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_set
 
 
-def process_response_to_segments(api_data):
+def extract_speaker_ids_from_filename(filename):
+    """
+    Extract the first two numeric tokens from the filename as an ordered list.
+
+    Examples:
+      252_255_847201-847222-430.wav     -> ["252", "255"]
+      252-255-847201-847222-430.wav     -> ["252", "255"]
+      252-255-847201-847222-430_DIN.wav -> ["252", "255"]
+
+    Returns a list where index 0 = first real speaker, index 1 = second real speaker.
+    ElevenLabs diarization uses "speaker_0", "speaker_1", ... so the list index
+    directly matches the numeric suffix.
+    """
+    base_name = os.path.splitext(filename)[0]
+    numbers = re.findall(r"\d+", base_name)
+    return numbers[:2]
+
+
+def process_response_to_segments(api_data, speaker_ids=None):
     """
     Group ElevenLabs word-level output into speaker segments.
     Returns the internal segment list AND the flat download format.
@@ -59,34 +77,53 @@ def process_response_to_segments(api_data):
 
     Flat download format (for JSON download):
       { index, speaker_id, start_time, end_time, text }
+
+    Args:
+        api_data:    The transcription data from ElevenLabs.
+        speaker_ids: Ordered list of real speaker IDs extracted from the filename
+                     (e.g. ["252", "255"]).  ElevenLabs returns diarization IDs as
+                     "speaker_0", "speaker_1", ...; the numeric suffix is used as the
+                     0-based index into this list.
     """
     input_words = api_data.get("words", [])
     language_code = api_data.get("language_code", "en")
     full_text = api_data.get("text", "")
 
+    if not speaker_ids:
+        speaker_ids = []
+
     segments = []
     current_segment = None
 
     index_base = int(os.environ.get("INDEX_BASE", "0"))
-    speaker_id_base = int(os.environ.get("SPEAKER_ID_BASE", "1316"))
-    speaker_map = {}
 
     def map_speaker_id(raw_id):
-        key = raw_id if raw_id else "unknown"
-        if key not in speaker_map:
-            speaker_map[key] = str(speaker_id_base + len(speaker_map))
-        return speaker_map[key]
+        """
+        Map an ElevenLabs diarization speaker ID to a real speaker ID.
+
+        Handles both "speaker_N" (ElevenLabs format) and plain numeric strings.
+        Falls back to the raw value if no mapping exists.
+        """
+        raw_id_str = str(raw_id) if raw_id else "unknown"
+        # "speaker_0" / "speaker_1" format used by ElevenLabs
+        m = re.match(r"speaker_(\d+)$", raw_id_str)
+        if m:
+            idx = int(m.group(1))
+            if idx < len(speaker_ids):
+                return speaker_ids[idx]
+        return raw_id_str
 
     for word in input_words:
         text = word.get("text", "")
         start = word.get("start", 0.0)
         end = word.get("end", 0.0)
         spk_id_raw = word.get("speaker_id", "unknown")
+        segment_speaker_key = spk_id_raw if spk_id_raw else "unknown"
         spk_id = map_speaker_id(spk_id_raw)
 
         formatted_word = {"text": text, "start_time": start, "end_time": end}
 
-        if current_segment is None or current_segment["speaker"]["id"] != spk_id:
+        if current_segment is None or current_segment["speaker_key"] != segment_speaker_key:
             if current_segment:
                 # Build clean segment text from word tokens
                 current_segment["text"] = re.sub(
@@ -99,6 +136,7 @@ def process_response_to_segments(api_data):
                 "text": "",
                 "start_time": start,
                 "end_time": end,
+                "speaker_key": segment_speaker_key,
                 "speaker": {
                     "id": spk_id,
                     "name": f"Speaker {spk_id}",
@@ -116,6 +154,9 @@ def process_response_to_segments(api_data):
             "".join(w["text"] for w in current_segment["words"]),
         ).strip()
         segments.append(current_segment)
+
+    for seg in segments:
+        seg.pop("speaker_key", None)
 
     # Build flat download format
     flat_segments = [
@@ -194,7 +235,8 @@ def transcribe():
         }
 
         print("[INFO] Processing segments...")
-        result = process_response_to_segments(raw_data)
+        speaker_ids = extract_speaker_ids_from_filename(filename)
+        result = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
 
         # Save flat format to disk for debugging
         with open(OUTPUT_FILENAME, "w", encoding="utf-8") as f:
@@ -264,7 +306,8 @@ def translate():
             ],
         }
 
-        result = process_response_to_segments(raw_data)
+        speaker_ids = extract_speaker_ids_from_filename(filename)
+        result = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
         return jsonify({"success": True, "data": result})
 
     except Exception as e:
