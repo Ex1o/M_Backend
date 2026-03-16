@@ -117,17 +117,6 @@ def process_response_to_segments(
     api_data: dict,
     speaker_ids: list[str] | None = None,
 ) -> dict:
-    """
-    Group ElevenLabs word-level transcription data into speaker segments.
-
-    Returns:
-        {
-          "text":          str,   # full transcript
-          "language_code": str,
-          "segments":      list,  # rich format for frontend display
-          "flat_segments": list,  # flat format for JSON download
-        }
-    """
     words         = api_data.get("words", [])
     language_code = api_data.get("language_code", "en")
     full_text     = api_data.get("text", "")
@@ -135,19 +124,25 @@ def process_response_to_segments(
 
     segments: list[dict] = []
     current:  dict | None = None
-    speaker_slots: dict[str, int] = {}
+    speaker_slots: dict[str, int] = {}  # raw_spk -> slot index (0,1,2...)
 
     for word in words:
-        text    = word.get("text", "")
-        start   = word.get("start", 0.0)
-        end     = word.get("end", 0.0)
+        text     = word.get("text", "")
+        start    = word.get("start", 0.0)
+        end      = word.get("end", 0.0)
         raw_spk_value = word.get("speaker_id")
-        raw_spk = str(raw_spk_value) if raw_spk_value not in (None, "") else "unknown"
+        raw_spk  = str(raw_spk_value) if raw_spk_value not in (None, "") else "unknown"
+
+        # Assign slot index in first-appearance order
         if raw_spk not in speaker_slots:
-            speaker_slots[raw_spk] = len(speaker_slots)
-        speaker_number = speaker_slots[raw_spk] + 1
-        mapped_idx = speaker_slots[raw_spk]
-        spk_id = speaker_ids[mapped_idx] if mapped_idx < len(speaker_ids) else raw_spk
+            slot = len(speaker_slots)
+            speaker_slots[raw_spk] = slot
+            log.info("New speaker seen: %r -> slot %d -> mapped ID: %s",
+                     raw_spk, slot, speaker_ids[slot] if slot < len(speaker_ids) else raw_spk)
+
+        slot       = speaker_slots[raw_spk]
+        mapped_id  = speaker_ids[slot] if slot < len(speaker_ids) else raw_spk
+        label      = f"Speaker {mapped_id}"
 
         if current is None or current["_spk_key"] != raw_spk:
             if current:
@@ -158,7 +153,7 @@ def process_response_to_segments(
                 "text":       "",
                 "start_time": start,
                 "end_time":   end,
-                "speaker":    {"id": spk_id, "name": f"Speaker {speaker_number}"},
+                "speaker":    {"id": mapped_id, "name": label},
                 "words":      [{"text": text, "start_time": start, "end_time": end}],
             }
         else:
@@ -189,7 +184,6 @@ def process_response_to_segments(
         "segments":      segments,
         "flat_segments": flat_segments,
     }
-
 
 def enforce_filename_speaker_mapping(result: dict, speaker_ids: list[str]) -> dict:
     """Force speaker_id mapping using filename IDs in first-appearance order."""
