@@ -191,6 +191,49 @@ def process_response_to_segments(
     }
 
 
+def enforce_filename_speaker_mapping(result: dict, speaker_ids: list[str]) -> dict:
+    """Force speaker_id mapping using filename IDs in first-appearance order."""
+    if not speaker_ids:
+        return result
+
+    speaker_slots: dict[str, int] = {}
+
+    def map_speaker(raw_speaker: str) -> str:
+        if raw_speaker not in speaker_slots:
+            speaker_slots[raw_speaker] = len(speaker_slots)
+        idx = speaker_slots[raw_speaker]
+        return speaker_ids[idx] if idx < len(speaker_ids) else raw_speaker
+
+    remapped_segments: list[dict] = []
+    for seg in result.get("segments", []):
+        speaker_obj = seg.get("speaker") or {}
+        raw_speaker = str(speaker_obj.get("id") or speaker_obj.get("name") or "unknown")
+        mapped_id = map_speaker(raw_speaker)
+
+        seg_copy = dict(seg)
+        seg_copy["speaker"] = {"id": mapped_id, "name": f"Speaker {mapped_id}"}
+        remapped_segments.append(seg_copy)
+
+    remapped_flat_segments: list[dict] = []
+    for i, seg in enumerate(result.get("flat_segments", [])):
+        raw_speaker = str(seg.get("speaker_id") or "unknown")
+        mapped_id = map_speaker(raw_speaker)
+
+        remapped_flat_segments.append(
+            {
+                "index": int(seg.get("index", INDEX_BASE + i)),
+                "speaker_id": mapped_id,
+                "start_time": round(float(seg.get("start_time", 0.0)), 3),
+                "end_time": round(float(seg.get("end_time", 0.0)), 3),
+                "text": str(seg.get("text", "")).strip(),
+            }
+        )
+
+    result["segments"] = remapped_segments
+    result["flat_segments"] = remapped_flat_segments
+    return result
+
+
 def _call_elevenlabs(stream, filename: str) -> dict:
     """
     Send the audio stream directly to ElevenLabs — no disk writes.
@@ -316,6 +359,7 @@ def transcribe():
         raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(original_filename)
         result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
+        result      = enforce_filename_speaker_mapping(result, speaker_ids)
 
         if DEBUG_SAVE_TRANSCRIPT:
             out_path = os.path.join(BASE_DIR, "transcript_final.json")
@@ -347,6 +391,7 @@ def translate():
         raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(original_filename)
         result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
+        result      = enforce_filename_speaker_mapping(result, speaker_ids)
 
         log.info("Translation/transcription complete for %s", filename)
         return jsonify({"success": True, "data": result})
