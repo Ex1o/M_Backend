@@ -56,21 +56,21 @@ client = ElevenLabs(api_key=API_KEY)
 
 app = Flask(__name__)
 
-# CORS — default allows the Vercel frontend; set CORS_ORIGINS in Render env vars to
-# override (comma-separated list, e.g. "https://app.vercel.app,http://localhost:8080").
-_cors_raw = os.environ.get("CORS_ORIGINS", "https://frontend-kappa-one-13.vercel.app")
-_CORS_ORIGINS: list[str] | str = (
-    [o.strip() for o in _cors_raw.split(",") if o.strip()]
-    if "," in _cors_raw
-    else _cors_raw.strip()
+# CORS — explicitly allow the Vercel frontend domain
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["https://frontend-kappa-one-13.vercel.app", "http://localhost:3000", "http://localhost:8080"]}},
+    supports_credentials=True,
 )
-CORS(app, resources={r"/api/*": {"origins": _CORS_ORIGINS}})
 
-# 100 MB — sufficient for typical call recordings, prevents memory pressure
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
-
-# Preserve JSON key insertion order (Flask 2.x and 3.x)
+# Upload limits and streaming
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 app.config["JSON_SORT_KEYS"] = False
+
+# Werkzeug multipart form parser — stream to disk instead of buffering to memory
+# This prevents timeouts on large file uploads
+app.config["UPLOAD_FOLDER"] = "/tmp"
+
 try:
     app.json.sort_keys = False  # Flask 2.3+ / 3.x JSON provider
 except AttributeError:
@@ -88,36 +88,24 @@ def allowed_file(filename: str) -> bool:
 
 def extract_speaker_ids_from_filename(filename: str) -> list[str]:
     """
-    Extract the first two numeric tokens from the filename as an ordered list.
+    Extract ordered speaker IDs from underscore-separated filename tokens.
 
-    ElevenLabs diarization returns IDs as "speaker_0", "speaker_1", etc.
-    The numeric suffix is used as a 0-based index into this list.
+    Rules:
+      - Read tokens before file extension.
+      - Keep numeric IDs in underscore order.
+      - Ignore trailing take suffix after a space in the last token (e.g. "429 1").
 
     Examples:
-      "252_255_847201-847222-430.wav"     -> ["252", "255"]
-      "252-255-847201-847222-430.wav"     -> ["252", "255"]
-      "252-255-847201-847222-430_DIN.wav" -> ["252", "255"]
+      "256_259_847102_847104_429 1.wav" -> ["256", "259", "847102", "847104", "429"]
     """
-    base = os.path.splitext(filename)[0]
-    return re.findall(r"\d+", base)[:2]
-
-
-def _map_speaker_id(raw_id: str | None, speaker_ids: list[str]) -> str:
-    """
-    Resolve an ElevenLabs diarization ID to a real speaker ID from the filename.
-
-      "speaker_0" -> speaker_ids[0]
-      "speaker_1" -> speaker_ids[1]
-
-    Falls back to the raw value when no mapping entry exists.
-    """
-    raw = str(raw_id) if raw_id else "unknown"
-    m = re.match(r"speaker_(\d+)$", raw)
-    if m:
-        idx = int(m.group(1))
-        if idx < len(speaker_ids):
-            return speaker_ids[idx]
-    return raw
+    base = os.path.splitext(filename)[0].strip()
+    parts = [part.strip() for part in base.split("_") if part.strip()]
+    speaker_ids: list[str] = []
+    for part in parts:
+        m = re.match(r"^(\d+)", part)
+        if m:
+            speaker_ids.append(m.group(1))
+    return speaker_ids
 
 
 def _finalise_segment(seg: dict) -> None:
@@ -149,13 +137,18 @@ def process_response_to_segments(
 
     segments: list[dict] = []
     current:  dict | None = None
+    speaker_slots: dict[str, int] = {}
 
     for word in words:
         text    = word.get("text", "")
         start   = word.get("start", 0.0)
         end     = word.get("end", 0.0)
         raw_spk = word.get("speaker_id") or "unknown"
-        spk_id  = _map_speaker_id(raw_spk, speaker_ids)
+        if raw_spk not in speaker_slots:
+            speaker_slots[raw_spk] = len(speaker_slots)
+        speaker_number = speaker_slots[raw_spk] + 1
+        mapped_idx = speaker_slots[raw_spk]
+        spk_id = speaker_ids[mapped_idx] if mapped_idx < len(speaker_ids) else raw_spk
 
         if current is None or current["_spk_key"] != raw_spk:
             if current:
@@ -166,7 +159,7 @@ def process_response_to_segments(
                 "text":       "",
                 "start_time": start,
                 "end_time":   end,
-                "speaker":    {"id": spk_id, "name": f"Speaker {spk_id}"},
+                "speaker":    {"id": spk_id, "name": f"Speaker {speaker_number}"},
                 "words":      [{"text": text, "start_time": start, "end_time": end}],
             }
         else:
@@ -206,15 +199,22 @@ def _call_elevenlabs(stream, filename: str) -> dict:
     The SDK accepts a (filename, file_obj, mime_type) tuple so we can
     pass the request stream without buffering it to disk first.
     """
+    log.info("Starting ElevenLabs conversion for %s", filename)
+
     ext       = filename.rsplit(".", 1)[-1].lower()
     mime_type = MIME_MAP.get(ext, "application/octet-stream")
 
-    transcription = client.speech_to_text.convert(
-        file=(filename, stream, mime_type),
-        model_id="scribe_v2",
-        diarize=True,
-        tag_audio_events=True,
-    )
+    try:
+        transcription = client.speech_to_text.convert(
+            file=(filename, stream, mime_type),
+            model_id="scribe_v2",
+            diarize=True,
+            tag_audio_events=True,
+        )
+        log.info("ElevenLabs conversion completed for %s", filename)
+    except Exception as e:
+        log.error("ElevenLabs API error for %s: %s", filename, e)
+        raise
 
     return {
         "text":          transcription.text,
@@ -239,22 +239,40 @@ def _validate_upload(req) -> tuple[object, str, tuple | None]:
         (file, filename, None)           on success
         (None, None, (response, status)) on validation failure
     """
-    if "file" not in req.files:
-        return None, None, (jsonify({"success": False, "error": "No file part"}), 400)
+    # Check Content-Length header before accessing multipart data
+    content_length = req.content_length
+    max_bytes = app.config["MAX_CONTENT_LENGTH"]
 
-    file = req.files["file"]
-    if not file or not file.filename:
-        return None, None, (jsonify({"success": False, "error": "No file selected"}), 400)
+    if not content_length:
+        return None, None, (jsonify({"success": False, "error": "Missing Content-Length header"}), 400)
 
-    filename = secure_filename(file.filename)
-    if not allowed_file(filename):
-        allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
-        return None, None, (
-            jsonify({"success": False, "error": f"Invalid file type. Allowed: {allowed}"}),
-            415,
-        )
+    if content_length > max_bytes:
+        return None, None, (jsonify({"success": False, "error": f"File too large. Maximum: {max_bytes // (1024 * 1024)} MB"}), 413)
 
-    return file, filename, None
+    log.info("Parsing multipart form (size: %d bytes)", content_length)
+
+    try:
+        if "file" not in req.files:
+            return None, None, (jsonify({"success": False, "error": "No file part"}), 400)
+
+        file = req.files["file"]
+        if not file or not file.filename:
+            return None, None, (jsonify({"success": False, "error": "No file selected"}), 400)
+
+        filename = secure_filename(file.filename)
+        if not allowed_file(filename):
+            allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
+            return None, None, (
+                jsonify({"success": False, "error": f"Invalid file type. Allowed: {allowed}"}),
+                415,
+            )
+
+        log.info("Multipart parsed successfully: %s", filename)
+        return file, filename, None
+
+    except Exception as e:
+        log.error("Multipart parsing failed: %s", e)
+        return None, None, (jsonify({"success": False, "error": "Failed to parse upload"}), 400)
 
 
 # ==========================================
@@ -283,13 +301,16 @@ def index():
     )
 
 
-@app.route("/api/transcribe", methods=["POST"])
+@app.route("/api/transcribe", methods=["POST", "OPTIONS"])
 def transcribe():
+    """Transcribe audio file and return segment-based transcription with speaker IDs."""
+    log.info("POST /api/transcribe — validating upload")
+
     file, filename, err = _validate_upload(request)
     if err:
         return err
 
-    log.info("Transcribing '%s'", filename)
+    log.info("Calling ElevenLabs for %s", filename)
     try:
         raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(filename)
@@ -301,30 +322,36 @@ def transcribe():
                 json.dump(result["flat_segments"], fh, indent=2, ensure_ascii=False)
             log.debug("Saved debug transcript -> %s", out_path)
 
-        log.info("Done — %d segments produced", len(result["segments"]))
+        log.info("Transcription complete — %d segments", len(result["segments"]))
         return jsonify({"success": True, "data": result})
 
     except Exception as exc:
-        log.error("Transcription failed: %s\n%s", exc, traceback.format_exc())
+        log.error("Transcription failed: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
-@app.route("/api/translate", methods=["POST"])
+@app.route("/api/translate", methods=["POST", "OPTIONS"])
 def translate():
+    """Translate transcript using ElevenLabs text translation (if available) or return transcription."""
+    log.info("POST /api/translate — validating upload")
+
     file, filename, err = _validate_upload(request)
     if err:
         return err
 
     target_language = request.form.get("target_language", "en")
-    log.info("Translating '%s' -> language=%s", filename, target_language)
+    log.info("Calling ElevenLabs for %s (target_language=%s)", filename, target_language)
+
     try:
         raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(filename)
         result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
+
+        log.info("Translation/transcription complete for %s", filename)
         return jsonify({"success": True, "data": result})
 
     except Exception as exc:
-        log.error("Translation failed: %s\n%s", exc, traceback.format_exc())
+        log.error("Translation failed: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
