@@ -141,7 +141,8 @@ def process_response_to_segments(
         text    = word.get("text", "")
         start   = word.get("start", 0.0)
         end     = word.get("end", 0.0)
-        raw_spk = word.get("speaker_id") or "unknown"
+        raw_spk_value = word.get("speaker_id")
+        raw_spk = str(raw_spk_value) if raw_spk_value not in (None, "") else "unknown"
         if raw_spk not in speaker_slots:
             speaker_slots[raw_spk] = len(speaker_slots)
         speaker_number = speaker_slots[raw_spk] + 1
@@ -174,7 +175,7 @@ def process_response_to_segments(
     flat_segments = [
         {
             "index":      INDEX_BASE + i,
-            "speaker_id": seg["speaker"]["id"],
+            "speaker_id": str(seg["speaker"]["id"]),
             "start_time": round(float(seg["start_time"]), 3),
             "end_time":   round(float(seg["end_time"]),   3),
             "text":       seg["text"],
