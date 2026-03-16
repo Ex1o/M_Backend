@@ -1,181 +1,253 @@
-import os
-import sys
+from __future__ import annotations
+
 import json
+import logging
+import os
 import re
+import sys
+import traceback
+
+from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from elevenlabs.client import ElevenLabs
-from dotenv import load_dotenv
-
-# Fix Windows console Unicode encoding issue
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
 
 # ==========================================
-# CONFIG — load from .env if present
+# LOGGING  (stdout so Render captures it)
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger(__name__)
+
+# ==========================================
+# CONFIG
 # ==========================================
 load_dotenv()
+
 API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 if not API_KEY:
-    raise RuntimeError("ELEVENLABS_API_KEY not set. Add it to Backend/.env")
+    raise RuntimeError("ELEVENLABS_API_KEY not set. Add it to .env or Render env vars.")
 
+# 0-based offset applied to segment index in flat output
+INDEX_BASE = int(os.environ.get("INDEX_BASE", "0"))
+
+# Set DEBUG_SAVE_TRANSCRIPT=1 in env to persist flat transcript to disk (dev only)
+DEBUG_SAVE_TRANSCRIPT = os.environ.get("DEBUG_SAVE_TRANSCRIPT", "0") == "1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILENAME = os.path.join(BASE_DIR, "transcript_final.json")
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-ALLOWED_AUDIO_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm"}
 
+ALLOWED_AUDIO_EXTENSIONS = {"wav", "mp3", "m4a", "ogg", "flac", "webm"}
+MIME_MAP = {
+    "wav":  "audio/wav",
+    "mp3":  "audio/mpeg",
+    "m4a":  "audio/mp4",
+    "ogg":  "audio/ogg",
+    "flac": "audio/flac",
+    "webm": "audio/webm",
+}
+
+# ==========================================
+# APP
+# ==========================================
 client = ElevenLabs(api_key=API_KEY)
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # 1 GB
-app.config["JSON_SORT_KEYS"] = False  # keep key order in JSON output
-try:
-    # Flask 2.3+/3.x JSON provider
-    app.json.sort_keys = False
-except Exception:
-    pass
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Allow CORS origins to be restricted via env var in production
+CORS(app, resources={r"/api/*": {"origins": os.environ.get("CORS_ORIGINS", "*")}})
+
+# 100 MB — sufficient for typical call recordings, prevents memory pressure
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
+
+# Preserve JSON key insertion order (Flask 2.x and 3.x)
+app.config["JSON_SORT_KEYS"] = False
+try:
+    app.json.sort_keys = False  # Flask 2.3+ / 3.x JSON provider
+except AttributeError:
+    pass
 
 
 # ==========================================
 # HELPERS
 # ==========================================
-def allowed_file(filename, allowed_set):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_set
+
+def allowed_file(filename: str) -> bool:
+    """Return True if the file extension is an allowed audio type."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_AUDIO_EXTENSIONS
 
 
-def extract_speaker_ids_from_filename(filename):
+def extract_speaker_ids_from_filename(filename: str) -> list[str]:
     """
     Extract the first two numeric tokens from the filename as an ordered list.
 
+    ElevenLabs diarization returns IDs as "speaker_0", "speaker_1", etc.
+    The numeric suffix is used as a 0-based index into this list.
+
     Examples:
-      252_255_847201-847222-430.wav     -> ["252", "255"]
-      252-255-847201-847222-430.wav     -> ["252", "255"]
-      252-255-847201-847222-430_DIN.wav -> ["252", "255"]
-
-    Returns a list where index 0 = first real speaker, index 1 = second real speaker.
-    ElevenLabs diarization uses "speaker_0", "speaker_1", ... so the list index
-    directly matches the numeric suffix.
+      "252_255_847201-847222-430.wav"     -> ["252", "255"]
+      "252-255-847201-847222-430.wav"     -> ["252", "255"]
+      "252-255-847201-847222-430_DIN.wav" -> ["252", "255"]
     """
-    base_name = os.path.splitext(filename)[0]
-    numbers = re.findall(r"\d+", base_name)
-    return numbers[:2]
+    base = os.path.splitext(filename)[0]
+    return re.findall(r"\d+", base)[:2]
 
 
-def process_response_to_segments(api_data, speaker_ids=None):
+def _map_speaker_id(raw_id: str | None, speaker_ids: list[str]) -> str:
     """
-    Group ElevenLabs word-level output into speaker segments.
-    Returns the internal segment list AND the flat download format.
+    Resolve an ElevenLabs diarization ID to a real speaker ID from the filename.
 
-    Internal segment format (for frontend display):
-      { text, start_time, end_time, speaker: { id, name }, words: [...] }
+      "speaker_0" -> speaker_ids[0]
+      "speaker_1" -> speaker_ids[1]
 
-    Flat download format (for JSON download):
-      { index, speaker_id, start_time, end_time, text }
-
-    Args:
-        api_data:    The transcription data from ElevenLabs.
-        speaker_ids: Ordered list of real speaker IDs extracted from the filename
-                     (e.g. ["252", "255"]).  ElevenLabs returns diarization IDs as
-                     "speaker_0", "speaker_1", ...; the numeric suffix is used as the
-                     0-based index into this list.
+    Falls back to the raw value when no mapping entry exists.
     """
-    input_words = api_data.get("words", [])
+    raw = str(raw_id) if raw_id else "unknown"
+    m = re.match(r"speaker_(\d+)$", raw)
+    if m:
+        idx = int(m.group(1))
+        if idx < len(speaker_ids):
+            return speaker_ids[idx]
+    return raw
+
+
+def _finalise_segment(seg: dict) -> None:
+    """Collapse word tokens into clean segment text in-place."""
+    seg["text"] = re.sub(
+        r"\s+", " ", "".join(w["text"] for w in seg["words"])
+    ).strip()
+
+
+def process_response_to_segments(
+    api_data: dict,
+    speaker_ids: list[str] | None = None,
+) -> dict:
+    """
+    Group ElevenLabs word-level transcription data into speaker segments.
+
+    Returns:
+        {
+          "text":          str,   # full transcript
+          "language_code": str,
+          "segments":      list,  # rich format for frontend display
+          "flat_segments": list,  # flat format for JSON download
+        }
+    """
+    words         = api_data.get("words", [])
     language_code = api_data.get("language_code", "en")
-    full_text = api_data.get("text", "")
+    full_text     = api_data.get("text", "")
+    speaker_ids   = speaker_ids or []
 
-    if not speaker_ids:
-        speaker_ids = []
+    segments: list[dict] = []
+    current:  dict | None = None
 
-    segments = []
-    current_segment = None
+    for word in words:
+        text    = word.get("text", "")
+        start   = word.get("start", 0.0)
+        end     = word.get("end", 0.0)
+        raw_spk = word.get("speaker_id") or "unknown"
+        spk_id  = _map_speaker_id(raw_spk, speaker_ids)
 
-    index_base = int(os.environ.get("INDEX_BASE", "0"))
-
-    def map_speaker_id(raw_id):
-        """
-        Map an ElevenLabs diarization speaker ID to a real speaker ID.
-
-        Handles both "speaker_N" (ElevenLabs format) and plain numeric strings.
-        Falls back to the raw value if no mapping exists.
-        """
-        raw_id_str = str(raw_id) if raw_id else "unknown"
-        # "speaker_0" / "speaker_1" format used by ElevenLabs
-        m = re.match(r"speaker_(\d+)$", raw_id_str)
-        if m:
-            idx = int(m.group(1))
-            if idx < len(speaker_ids):
-                return speaker_ids[idx]
-        return raw_id_str
-
-    for word in input_words:
-        text = word.get("text", "")
-        start = word.get("start", 0.0)
-        end = word.get("end", 0.0)
-        spk_id_raw = word.get("speaker_id", "unknown")
-        segment_speaker_key = spk_id_raw if spk_id_raw else "unknown"
-        spk_id = map_speaker_id(spk_id_raw)
-
-        formatted_word = {"text": text, "start_time": start, "end_time": end}
-
-        if current_segment is None or current_segment["speaker_key"] != segment_speaker_key:
-            if current_segment:
-                # Build clean segment text from word tokens
-                current_segment["text"] = re.sub(
-                    r"\s+",
-                    " ",
-                    "".join(w["text"] for w in current_segment["words"]),
-                ).strip()
-                segments.append(current_segment)
-            current_segment = {
-                "text": "",
+        if current is None or current["_spk_key"] != raw_spk:
+            if current:
+                _finalise_segment(current)
+                segments.append(current)
+            current = {
+                "_spk_key":   raw_spk,
+                "text":       "",
                 "start_time": start,
-                "end_time": end,
-                "speaker_key": segment_speaker_key,
-                "speaker": {
-                    "id": spk_id,
-                    "name": f"Speaker {spk_id}",
-                },
-                "words": [formatted_word],
+                "end_time":   end,
+                "speaker":    {"id": spk_id, "name": f"Speaker {spk_id}"},
+                "words":      [{"text": text, "start_time": start, "end_time": end}],
             }
         else:
-            current_segment["words"].append(formatted_word)
-            current_segment["end_time"] = end
+            current["words"].append({"text": text, "start_time": start, "end_time": end})
+            current["end_time"] = end
 
-    if current_segment:
-        current_segment["text"] = re.sub(
-            r"\s+",
-            " ",
-            "".join(w["text"] for w in current_segment["words"]),
-        ).strip()
-        segments.append(current_segment)
+    if current:
+        _finalise_segment(current)
+        segments.append(current)
 
     for seg in segments:
-        seg.pop("speaker_key", None)
+        seg.pop("_spk_key", None)
 
-    # Build flat download format
     flat_segments = [
         {
-            "index": index_base + i,
+            "index":      INDEX_BASE + i,
             "speaker_id": seg["speaker"]["id"],
             "start_time": round(float(seg["start_time"]), 3),
-            "end_time": round(float(seg["end_time"]), 3),
-            "text": seg["text"],
+            "end_time":   round(float(seg["end_time"]),   3),
+            "text":       seg["text"],
         }
         for i, seg in enumerate(segments)
     ]
 
     return {
-        "text": full_text,
+        "text":          full_text,
         "language_code": language_code,
-        "segments": segments,           # rich format for display
-        "flat_segments": flat_segments, # flat format for download
+        "segments":      segments,
+        "flat_segments": flat_segments,
     }
+
+
+def _call_elevenlabs(stream, filename: str) -> dict:
+    """
+    Send the audio stream directly to ElevenLabs — no disk writes.
+
+    The SDK accepts a (filename, file_obj, mime_type) tuple so we can
+    pass the request stream without buffering it to disk first.
+    """
+    ext       = filename.rsplit(".", 1)[-1].lower()
+    mime_type = MIME_MAP.get(ext, "application/octet-stream")
+
+    transcription = client.speech_to_text.convert(
+        file=(filename, stream, mime_type),
+        model_id="scribe_v2",
+        diarize=True,
+        tag_audio_events=True,
+    )
+
+    return {
+        "text":          transcription.text,
+        "language_code": transcription.language_code,
+        "words": [
+            {
+                "text":       w.text,
+                "start":      w.start,
+                "end":        w.end,
+                "speaker_id": w.speaker_id,
+            }
+            for w in transcription.words
+        ],
+    }
+
+
+def _validate_upload(req) -> tuple[object, str, tuple | None]:
+    """
+    Validate the multipart file upload on an incoming request.
+
+    Returns:
+        (file, filename, None)           on success
+        (None, None, (response, status)) on validation failure
+    """
+    if "file" not in req.files:
+        return None, None, (jsonify({"success": False, "error": "No file part"}), 400)
+
+    file = req.files["file"]
+    if not file or not file.filename:
+        return None, None, (jsonify({"success": False, "error": "No file selected"}), 400)
+
+    filename = secure_filename(file.filename)
+    if not allowed_file(filename):
+        allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
+        return None, None, (
+            jsonify({"success": False, "error": f"Invalid file type. Allowed: {allowed}"}),
+            415,
+        )
+
+    return file, filename, None
 
 
 # ==========================================
@@ -187,138 +259,56 @@ def index():
     return (
         "<h2>Audio Insights Hub Backend</h2>"
         "<p>Status: Running</p>"
-        "<p>API endpoints: /api/transcribe, /api/translate, /api/health</p>"
+        "<p>Endpoints: "
+        "POST /api/transcribe &nbsp;|&nbsp; "
+        "POST /api/translate &nbsp;|&nbsp; "
+        "GET /api/health</p>"
     )
+
 
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe():
-    if "file" not in request.files:
-        return jsonify({"success": False, "error": "No file part"}), 400
+    file, filename, err = _validate_upload(request)
+    if err:
+        return err
 
-    file = request.files["file"]
-    if not file or file.filename == "":
-        return jsonify({"success": False, "error": "No selected file"}), 400
-
-    if not allowed_file(file.filename, ALLOWED_AUDIO_EXTENSIONS):
-        return jsonify({
-            "success": False,
-            "error": f"Invalid file type. Allowed: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}"
-        }), 400
-
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(file_path)
-
+    log.info("Transcribing '%s'", filename)
     try:
-        print(f"[INFO] Sending '{filename}' to ElevenLabs...")
-
-        with open(file_path, "rb") as audio_file:
-            transcription = client.speech_to_text.convert(
-                file=audio_file,
-                model_id="scribe_v2",
-                diarize=True,
-                tag_audio_events=True,
-            )
-
-        raw_data = {
-            "text": transcription.text,
-            "language_code": transcription.language_code,
-            "words": [
-                {
-                    "text": w.text,
-                    "start": w.start,
-                    "end": w.end,
-                    "speaker_id": w.speaker_id,
-                }
-                for w in transcription.words
-            ],
-        }
-
-        print("[INFO] Processing segments...")
+        raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(filename)
-        result = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
+        result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
 
-        # Save flat format to disk for debugging
-        with open(OUTPUT_FILENAME, "w", encoding="utf-8") as f:
-            json.dump(result["flat_segments"], f, indent=2, ensure_ascii=False)
+        if DEBUG_SAVE_TRANSCRIPT:
+            out_path = os.path.join(BASE_DIR, "transcript_final.json")
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(result["flat_segments"], fh, indent=2, ensure_ascii=False)
+            log.debug("Saved debug transcript -> %s", out_path)
 
-        print(f"[DONE] Segments: {len(result['segments'])}")
-
+        log.info("Done — %d segments produced", len(result["segments"]))
         return jsonify({"success": True, "data": result})
 
-    except Exception as e:
-        import traceback
-        tb_str = traceback.format_exc()
-        print(f"[ERROR] {e}\nTraceback:\n{tb_str}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": tb_str
-        }), 500
+    except Exception as exc:
+        log.error("Transcription failed: %s\n%s", exc, traceback.format_exc())
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route("/api/translate", methods=["POST"])
 def translate():
-    if "file" not in request.files:
-        return jsonify({"success": False, "error": "No file part"}), 400
-
-    file = request.files["file"]
-    if not file or file.filename == "":
-        return jsonify({"success": False, "error": "No selected file"}), 400
+    file, filename, err = _validate_upload(request)
+    if err:
+        return err
 
     target_language = request.form.get("target_language", "en")
-    
-    if not allowed_file(file.filename, ALLOWED_AUDIO_EXTENSIONS):
-        return jsonify({
-            "success": False,
-            "error": f"Invalid file type. Allowed: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}"
-        }), 400
-
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(file_path)
-
+    log.info("Translating '%s' -> language=%s", filename, target_language)
     try:
-        print(f"[INFO] Translating '{filename}' to {target_language}...")
-
-        with open(file_path, "rb") as audio_file:
-            # Note: ElevenLabs Scribe v2 handles transcription.
-            # For true translation, one might use a different model or process.
-            # Here we follow the existing pattern but with fixed variable names.
-            transcription = client.speech_to_text.convert(
-                file=audio_file,
-                model_id="scribe_v2",
-                diarize=True,
-                tag_audio_events=True,
-            )
-
-        raw_data = {
-            "text": transcription.text,
-            "language_code": transcription.language_code,
-            "words": [
-                {
-                    "text": w.text,
-                    "start": w.start,
-                    "end": w.end,
-                    "speaker_id": w.speaker_id,
-                }
-                for w in transcription.words
-            ],
-        }
-
+        raw_data    = _call_elevenlabs(file.stream, filename)
         speaker_ids = extract_speaker_ids_from_filename(filename)
-        result = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
+        result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
         return jsonify({"success": True, "data": result})
 
-    except Exception as e:
-        import traceback
-        tb_str = traceback.format_exc()
-        print(f"[ERROR] {e}\nTraceback:\n{tb_str}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": tb_str
-        }), 500
+    except Exception as exc:
+        log.error("Translation failed: %s\n%s", exc, traceback.format_exc())
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route("/api/health")
@@ -327,6 +317,6 @@ def health():
 
 
 if __name__ == "__main__":
-    # Default to 5000 to match Vite dev proxy (audio-insights-hub/vite.config.ts).
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # debug=False is required when running under Gunicorn
+    app.run(host="0.0.0.0", port=port, debug=False)
