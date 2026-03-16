@@ -56,8 +56,15 @@ client = ElevenLabs(api_key=API_KEY)
 
 app = Flask(__name__)
 
-# Allow CORS origins to be restricted via env var in production
-CORS(app, resources={r"/api/*": {"origins": os.environ.get("CORS_ORIGINS", "*")}})
+# CORS — default allows the Vercel frontend; set CORS_ORIGINS in Render env vars to
+# override (comma-separated list, e.g. "https://app.vercel.app,http://localhost:8080").
+_cors_raw = os.environ.get("CORS_ORIGINS", "https://frontend-kappa-one-13.vercel.app")
+_CORS_ORIGINS: list[str] | str = (
+    [o.strip() for o in _cors_raw.split(",") if o.strip()]
+    if "," in _cors_raw
+    else _cors_raw.strip()
+)
+CORS(app, resources={r"/api/*": {"origins": _CORS_ORIGINS}})
 
 # 100 MB — sufficient for typical call recordings, prevents memory pressure
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
@@ -248,6 +255,16 @@ def _validate_upload(req) -> tuple[object, str, tuple | None]:
         )
 
     return file, filename, None
+
+
+# ==========================================
+# ERROR HANDLERS
+# ==========================================
+
+@app.errorhandler(413)
+def request_too_large(e):
+    mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return jsonify({"success": False, "error": f"File too large. Maximum upload size is {mb} MB."}), 413
 
 
 # ==========================================
