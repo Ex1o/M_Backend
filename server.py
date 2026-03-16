@@ -87,25 +87,23 @@ def allowed_file(filename: str) -> bool:
 
 
 def extract_speaker_ids_from_filename(filename: str) -> list[str]:
-    """
-    Extract ordered speaker IDs from underscore-separated filename tokens.
+        """
+        Extract ordered speaker IDs from filename.
 
-    Rules:
-      - Read tokens before file extension.
-      - Keep numeric IDs in underscore order.
-      - Ignore trailing take suffix after a space in the last token (e.g. "429 1").
+        Rules:
+            - Remove file extension.
+            - Remove trailing recording indicator such as " 1".
+            - Treat both "-" and "_" as separators.
+            - Keep only purely numeric tokens in their original order.
 
-    Examples:
-      "256_259_847102_847104_429 1.wav" -> ["256", "259", "847102", "847104", "429"]
-    """
-    base = os.path.splitext(filename)[0].strip()
-    parts = [part.strip() for part in base.split("_") if part.strip()]
-    speaker_ids: list[str] = []
-    for part in parts:
-        m = re.match(r"^(\d+)", part)
-        if m:
-            speaker_ids.append(m.group(1))
-    return speaker_ids
+        Examples:
+            "256_259_847102_847104_429 1.wav" -> ["256", "259", "847102", "847104", "429"]
+            "256-259-847102_847104_429.wav"   -> ["256", "259", "847102", "847104", "429"]
+        """
+        base = os.path.splitext(filename)[0].strip()
+        base = re.sub(r"\s+\d+$", "", base)
+        parts = [part.strip() for part in re.split(r"[-_]", base) if part.strip()]
+        return [part for part in parts if re.fullmatch(r"\d+", part)]
 
 
 def _finalise_segment(seg: dict) -> None:
@@ -231,48 +229,50 @@ def _call_elevenlabs(stream, filename: str) -> dict:
     }
 
 
-def _validate_upload(req) -> tuple[object, str, tuple | None]:
+def _validate_upload(req) -> tuple[object, str, str, tuple | None]:
     """
     Validate the multipart file upload on an incoming request.
 
     Returns:
-        (file, filename, None)           on success
-        (None, None, (response, status)) on validation failure
+        (file, safe_filename, original_filename, None)               on success
+        (None, None, None, (response, status))                       on validation failure
     """
     # Check Content-Length header before accessing multipart data
     content_length = req.content_length
     max_bytes = app.config["MAX_CONTENT_LENGTH"]
 
     if not content_length:
-        return None, None, (jsonify({"success": False, "error": "Missing Content-Length header"}), 400)
+        return None, None, None, (jsonify({"success": False, "error": "Missing Content-Length header"}), 400)
 
     if content_length > max_bytes:
-        return None, None, (jsonify({"success": False, "error": f"File too large. Maximum: {max_bytes // (1024 * 1024)} MB"}), 413)
+        return None, None, None, (jsonify({"success": False, "error": f"File too large. Maximum: {max_bytes // (1024 * 1024)} MB"}), 413)
 
     log.info("Parsing multipart form (size: %d bytes)", content_length)
 
     try:
         if "file" not in req.files:
-            return None, None, (jsonify({"success": False, "error": "No file part"}), 400)
+            return None, None, None, (jsonify({"success": False, "error": "No file part"}), 400)
 
         file = req.files["file"]
         if not file or not file.filename:
-            return None, None, (jsonify({"success": False, "error": "No file selected"}), 400)
+            return None, None, None, (jsonify({"success": False, "error": "No file selected"}), 400)
 
-        filename = secure_filename(file.filename)
-        if not allowed_file(filename):
+        original_filename = file.filename.strip()
+        filename = secure_filename(original_filename)
+
+        if not allowed_file(original_filename):
             allowed = ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS))
-            return None, None, (
+            return None, None, None, (
                 jsonify({"success": False, "error": f"Invalid file type. Allowed: {allowed}"}),
                 415,
             )
 
-        log.info("Multipart parsed successfully: %s", filename)
-        return file, filename, None
+        log.info("Multipart parsed successfully: %s", original_filename)
+        return file, filename, original_filename, None
 
     except Exception as e:
         log.error("Multipart parsing failed: %s", e)
-        return None, None, (jsonify({"success": False, "error": "Failed to parse upload"}), 400)
+        return None, None, None, (jsonify({"success": False, "error": "Failed to parse upload"}), 400)
 
 
 # ==========================================
@@ -306,14 +306,14 @@ def transcribe():
     """Transcribe audio file and return segment-based transcription with speaker IDs."""
     log.info("POST /api/transcribe — validating upload")
 
-    file, filename, err = _validate_upload(request)
+    file, filename, original_filename, err = _validate_upload(request)
     if err:
         return err
 
     log.info("Calling ElevenLabs for %s", filename)
     try:
         raw_data    = _call_elevenlabs(file.stream, filename)
-        speaker_ids = extract_speaker_ids_from_filename(filename)
+        speaker_ids = extract_speaker_ids_from_filename(original_filename)
         result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
 
         if DEBUG_SAVE_TRANSCRIPT:
@@ -335,7 +335,7 @@ def translate():
     """Translate transcript using ElevenLabs text translation (if available) or return transcription."""
     log.info("POST /api/translate — validating upload")
 
-    file, filename, err = _validate_upload(request)
+    file, filename, original_filename, err = _validate_upload(request)
     if err:
         return err
 
@@ -344,7 +344,7 @@ def translate():
 
     try:
         raw_data    = _call_elevenlabs(file.stream, filename)
-        speaker_ids = extract_speaker_ids_from_filename(filename)
+        speaker_ids = extract_speaker_ids_from_filename(original_filename)
         result      = process_response_to_segments(raw_data, speaker_ids=speaker_ids)
 
         log.info("Translation/transcription complete for %s", filename)
